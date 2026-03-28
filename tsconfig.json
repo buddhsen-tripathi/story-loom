@@ -18,8 +18,12 @@
         "name": "next"
       }
     ],
+    "baseUrl": ".",
     "paths": {
-      "@/*": ["./*"]
+      "@/*": ["./*"],
+      "firebase/app": ["./node_modules/firebase/app/dist/app"],
+      "firebase/auth": ["./node_modules/firebase/auth/dist/auth"],
+      "firebase/firestore": ["./node_modules/firebase/firestore/dist/firestore"]
     }
   },
   "include": [
