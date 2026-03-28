@@ -52,6 +52,10 @@ export interface PanelDoc {
   positionX: number
   positionY: number
   hasFailed?: boolean
+  /** R2 presigned URL of the generated video clip */
+  videoUrl?: string
+  /** R2 object key for regenerating expired presigned URLs */
+  videoKey?: string
 }
 
 export interface EdgeDoc {
@@ -310,6 +314,21 @@ export async function deleteStory(storyId: string): Promise<void> {
   panelsSnap.docs.forEach((d: QueryDocumentSnapshot) => batch.delete(d.ref))
   edgesSnap.docs.forEach((d: QueryDocumentSnapshot) => batch.delete(d.ref))
   await batch.commit()
+}
+
+export async function saveVideoUrl(storyId: string, panelId: string, videoUrl: string, videoKey?: string): Promise<void> {
+  dbLog("saveVideoUrl", { storyId, panelId })
+  try {
+    const db = getFirebaseDb()
+    await setDoc(
+      panelRef(db, storyId, panelId),
+      { videoUrl, ...(videoKey ? { videoKey } : {}), updatedAt: serverTimestamp() },
+      { merge: true },
+    )
+    dbLog("saveVideoUrl: done", { panelId })
+  } catch (err) {
+    dbError("saveVideoUrl", err)
+  }
 }
 
 export async function updateStoryPrompt(storyId: string, prompt: string): Promise<void> {

@@ -3,6 +3,7 @@ const firebaseBase = "./node_modules/firebase"
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  output: "standalone",
   turbopack: {
     resolveAlias: {
       "firebase/app": `${firebaseBase}/app/dist/esm/index.esm.js`,

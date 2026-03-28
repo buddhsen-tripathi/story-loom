@@ -28,6 +28,7 @@ import {
   saveBranch,
   saveEdges,
   savePanel,
+  saveVideoUrl,
   updateStoryTitle,
   type EdgeDoc,
   type PanelDoc,
@@ -87,6 +88,8 @@ interface ChatMessage {
   role: "assistant" | "user"
   text: string
   tasks?: TaskStep[]
+  action?: { type: "play-video"; branchId: string }
+  suggestions?: string[]
 }
 
 type FlowNode = Node<PanelData>
@@ -372,7 +375,7 @@ function withHandlers({
 }: {
   nodes: FlowNode[]
   onBranch: (nodeId: string) => void
-  onAnimate: (branchId: string) => void
+  onAnimate: (branchId: string, nodeId: string) => void
 }) {
   return nodes.map((node) => ({
     ...node,
@@ -754,30 +757,40 @@ export function StoryLoomWorkbench() {
 
   // ------- open animation for a specific branch -------
   const openAnimation = useCallback(
-    (branchId: string) => {
+    (branchId: string, upToNodeId?: string) => {
       const branch = branchMap.get(branchId)
       if (!branch) return
 
-      // Build full ordered panel list: ancestor panels + own panels
+      const upToPanel = upToNodeId ? parsePanelNumber(upToNodeId) : Infinity
+
+      // Build ordered panel list up to the clicked panel
       const ownPanels = nodes
-        .filter((n) => branchIdOfNode(n.id) === branchId && !n.data.isLoading && !!n.data.imageUrl)
+        .filter((n) => {
+          if (branchIdOfNode(n.id) !== branchId) return false
+          if (n.data.isLoading || !n.data.imageUrl) return false
+          return parsePanelNumber(n.id) <= upToPanel
+        })
         .sort(sortByPanelNumber)
 
       if (!ownPanels.length) return
 
-      // Prepend ancestor panels if any — match by node ID, not title
-      const ancestorImages: { url: string; title: string; caption: string }[] = branch.sourceNodeId
+      // Prepend ancestor panels if any
+      const ancestorImages: { panelId: string; url: string; title: string; caption: string; videoUrl?: string }[] = branch.sourceNodeId
         ? collectAncestorNodes({ targetNodeId: branch.sourceNodeId, branchMap, nodes }).map((n) => ({
+            panelId: n.id,
             url: n.data.imageUrl,
             title: n.data.title,
             caption: n.data.caption,
+            videoUrl: n.data.videoUrl,
           }))
         : []
 
       const ownImages = ownPanels.map((n) => ({
+        panelId: n.id,
         url: n.data.imageUrl,
         title: n.data.title,
         caption: n.data.caption,
+        videoUrl: n.data.videoUrl,
       }))
 
       const images = [...ancestorImages, ...ownImages]
@@ -809,9 +822,9 @@ export function StoryLoomWorkbench() {
         },
       ])
 
-      setAnimation({ open: true, branchId, images, statusMessageId: animStatusId })
+      setAnimation({ open: true, branchId, storyId: storyId ?? undefined, images, statusMessageId: animStatusId })
     },
-    [branchMap, nodes],
+    [branchMap, nodes, storyId],
   )
 
   const handleGenerate = useCallback(async (
@@ -961,6 +974,8 @@ export function StoryLoomWorkbench() {
             branchColor: branch?.nodeColor ?? "#111827",
             isLoading: false,
             hasFailed: p.hasFailed ?? false,
+            videoUrl: p.videoUrl,
+            videoKey: p.videoKey,
             onBranch: () => {},
             onAnimate: () => {},
           },
@@ -1054,12 +1069,19 @@ export function StoryLoomWorkbench() {
         data.wildcards.forEach((wc) => lines.push(`  ${wc}`))
       }
 
+      // Collect all actionable suggestions for click-to-use
+      const suggestions = [
+        ...(data.nextBeats ?? []),
+        ...(data.wildcards ?? []),
+      ]
+
       setMessages((cur) => [
         ...cur,
         {
           id: `m-${Date.now()}-insp-result`,
           role: "assistant",
           text: lines.join("\n"),
+          suggestions,
         },
       ])
     } catch (error) {
@@ -1235,6 +1257,24 @@ export function StoryLoomWorkbench() {
               updateTaskInMessage(cur, animation.statusMessageId!, panelIndex, { status })
             )
           }}
+          onVideoSaved={(panelId, videoUrl, videoKey) => {
+            if (storyId) void saveVideoUrl(storyId, panelId, videoUrl, videoKey)
+            setNodes((cur) =>
+              cur.map((n) => (n.id === panelId ? { ...n, data: { ...n.data, videoUrl, videoKey } } : n))
+            )
+          }}
+          onAllClipsDone={(branchId) => {
+            const branchLabel = branchMap.get(branchId)?.label ?? branchId
+            setMessages((cur) => [
+              ...cur,
+              {
+                id: `m-${Date.now()}-video-ready`,
+                role: "assistant",
+                text: `${branchLabel} video is ready.`,
+                action: { type: "play-video", branchId },
+              },
+            ])
+          }}
         />
       )}
 
@@ -1372,6 +1412,35 @@ export function StoryLoomWorkbench() {
                             </li>
                           ))}
                         </ul>
+                      )}
+                      {msg.action?.type === "play-video" && (
+                        <button
+                          type="button"
+                          onClick={() => openAnimation(msg.action!.branchId)}
+                          className="mt-2 inline-flex items-center gap-1.5 rounded-full bg-primary/10 px-3 py-1.5 text-xs text-primary transition hover:bg-primary/20"
+                        >
+                          <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor" className="shrink-0">
+                            <polygon points="2.5,1 10.5,6 2.5,11" />
+                          </svg>
+                          Watch video
+                        </button>
+                      )}
+                      {msg.suggestions && msg.suggestions.length > 0 && (
+                        <div className="mt-2.5 flex flex-wrap gap-1.5">
+                          {msg.suggestions.map((s, i) => (
+                            <button
+                              key={i}
+                              type="button"
+                              onClick={() => {
+                                setChatInput(s)
+                                chatInputRef.current?.focus()
+                              }}
+                              className="rounded-full border border-primary/20 bg-primary/[0.06] px-2.5 py-1 text-left text-[11px] leading-snug text-foreground/80 transition hover:border-primary/40 hover:bg-primary/[0.12]"
+                            >
+                              {s.length > 80 ? `${s.slice(0, 77)}…` : s}
+                            </button>
+                          ))}
+                        </div>
                       )}
                     </div>
                   ))}

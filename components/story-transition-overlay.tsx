@@ -5,7 +5,8 @@ import { useCallback, useEffect, useRef, useState } from "react"
 export interface AnimationState {
   open: boolean
   branchId: string
-  images: { url: string; title: string; caption: string }[]
+  storyId?: string
+  images: { panelId: string; url: string; title: string; caption: string; videoUrl?: string }[]
   statusMessageId?: string
 }
 
@@ -22,10 +23,20 @@ interface StoryTransitionOverlayProps {
   animation: AnimationState
   onClose: () => void
   onClipProgress?: (panelIndex: number, status: "running" | "done" | "error") => void
+  onVideoSaved?: (panelId: string, videoUrl: string, videoKey?: string) => void
+  onAllClipsDone?: (branchId: string) => void
 }
 
-export function StoryTransitionOverlay({ animation, onClose, onClipProgress }: StoryTransitionOverlayProps) {
+export function StoryTransitionOverlay({ animation, onClose, onClipProgress, onVideoSaved, onAllClipsDone }: StoryTransitionOverlayProps) {
   const [index, setIndex] = useState(0)
+
+  // Stable refs for callbacks — avoids re-creating generateVideo on every render
+  const clipProgressRef = useRef(onClipProgress)
+  clipProgressRef.current = onClipProgress
+  const videoSavedRef = useRef(onVideoSaved)
+  videoSavedRef.current = onVideoSaved
+  const allClipsDoneRef = useRef(onAllClipsDone)
+  allClipsDoneRef.current = onAllClipsDone
 
   // Video generation state
   const [videoStatus, setVideoStatus] = useState<VideoStatus>("idle")
@@ -34,10 +45,14 @@ export function StoryTransitionOverlay({ animation, onClose, onClipProgress }: S
   const [clipsReady, setClipsReady] = useState(0)
   const [activeClipIndex, setActiveClipIndex] = useState(0)
   const [isPlaying, setIsPlaying] = useState(false)
-  const videoRef = useRef<HTMLVideoElement>(null)
   const abortRef = useRef<AbortController | null>(null)
 
-  // CSS morph auto-advance
+  // Dual video elements for gapless playback
+  const videoARef = useRef<HTMLVideoElement>(null)
+  const videoBRef = useRef<HTMLVideoElement>(null)
+  const [activePlayer, setActivePlayer] = useState<"A" | "B">("A")
+
+  // CSS morph auto-advance (while generating)
   useEffect(() => {
     if (videoStatus === "ready") return
     if (animation.images.length < 2) return
@@ -52,6 +67,26 @@ export function StoryTransitionOverlay({ animation, onClose, onClipProgress }: S
   }, [animation.images.length, animation.branchId, videoStatus])
 
   const generateVideo = useCallback(async () => {
+    // Check if all panels already have persisted video URLs (skip generation)
+    const existingClips: VideoClip[] = []
+    for (let i = 0; i < animation.images.length; i++) {
+      const img = animation.images[i]
+      if (img.videoUrl) {
+        existingClips.push({ panelIndex: i, videoUrl: img.videoUrl })
+      }
+    }
+    if (existingClips.length === animation.images.length) {
+      setVideoClips(existingClips)
+      setClipsReady(existingClips.length)
+      setVideoStatus("ready")
+      setActiveClipIndex(0)
+      setActivePlayer("A")
+      for (let i = 0; i < animation.images.length; i++) {
+        clipProgressRef.current?.(i, "done")
+      }
+      return
+    }
+
     setVideoStatus("generating")
     setVideoError(null)
     setVideoClips([])
@@ -60,13 +95,13 @@ export function StoryTransitionOverlay({ animation, onClose, onClipProgress }: S
     const controller = new AbortController()
     abortRef.current = controller
 
-    // Mark all clips as running in chat
     for (let i = 0; i < animation.images.length; i++) {
-      onClipProgress?.(i, "running")
+      clipProgressRef.current?.(i, "running")
     }
 
     try {
       const panels = animation.images.map((img) => ({
+        panelId: img.panelId,
         imageUrl: img.url,
         caption: img.caption,
       }))
@@ -74,7 +109,7 @@ export function StoryTransitionOverlay({ animation, onClose, onClipProgress }: S
       const response = await fetch("/api/generate-video", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ panels }),
+        body: JSON.stringify({ storyId: animation.storyId, panels }),
         signal: controller.signal,
       })
 
@@ -98,18 +133,25 @@ export function StoryTransitionOverlay({ animation, onClose, onClipProgress }: S
           if (!line.trim()) continue
           const msg = JSON.parse(line)
 
+          if (msg.type === "ping") continue
           if (msg.type === "clip") {
             setVideoClips((prev) => [...prev, { panelIndex: msg.panelIndex, videoUrl: msg.videoUrl }])
             setClipsReady((prev) => prev + 1)
-            onClipProgress?.(msg.panelIndex, "done")
+            clipProgressRef.current?.(msg.panelIndex, "done")
+            // Persist the R2 URL + key
+            if (msg.panelId && msg.videoUrl) {
+              videoSavedRef.current?.(msg.panelId, msg.videoUrl, msg.videoKey)
+            }
           } else if (msg.type === "done") {
             if (msg.failedIndices) {
               for (const fi of msg.failedIndices) {
-                onClipProgress?.(fi, "error")
+                clipProgressRef.current?.(fi, "error")
               }
             }
             setVideoStatus("ready")
             setActiveClipIndex(0)
+            setActivePlayer("A")
+            allClipsDoneRef.current?.(animation.branchId)
           } else if (msg.type === "error") {
             throw new Error(msg.error)
           }
@@ -117,14 +159,26 @@ export function StoryTransitionOverlay({ animation, onClose, onClipProgress }: S
       }
     } catch (err) {
       if (controller.signal.aborted) return
-      const message = err instanceof Error ? err.message : "Video generation failed"
-      setVideoError(message)
-      setVideoStatus("error")
-      for (let i = 0; i < animation.images.length; i++) {
-        onClipProgress?.(i, "error")
-      }
+      // If we already received some clips before the stream broke,
+      // show them as ready instead of failing everything.
+      setVideoClips((cur) => {
+        if (cur.length > 0) {
+          setVideoStatus("ready")
+          setActiveClipIndex(0)
+          setActivePlayer("A")
+          allClipsDoneRef.current?.(animation.branchId)
+        } else {
+          const message = err instanceof Error ? err.message : "Video generation failed"
+          setVideoError(message)
+          setVideoStatus("error")
+          for (let i = 0; i < animation.images.length; i++) {
+            clipProgressRef.current?.(i, "error")
+          }
+        }
+        return cur
+      })
     }
-  }, [animation.images, onClipProgress])
+  }, [animation.images, animation.storyId])
 
   // Auto-trigger video generation on mount
   const hasStartedVideo = useRef(false)
@@ -135,38 +189,59 @@ export function StoryTransitionOverlay({ animation, onClose, onClipProgress }: S
     }
   }, [animation.images.length, generateVideo])
 
-  // Abort on unmount (close)
-  useEffect(() => {
-    return () => {
-      abortRef.current?.abort()
-    }
-  }, [])
+  // Do NOT abort on unmount — let the server finish generating and uploading to R2.
+  // The server handles client disconnection gracefully and still persists clips.
+  // Aborting would waste the Veo generation quota.
 
-  // When a clip finishes playing, auto-advance to next — loop back to start at the end
+  // ---------- Dual-video gapless playback ----------
+
+  const getActiveEl = useCallback(() => activePlayer === "A" ? videoARef.current : videoBRef.current, [activePlayer])
+  const getNextEl = useCallback(() => activePlayer === "A" ? videoBRef.current : videoARef.current, [activePlayer])
+
+  // Load & play the active clip, preload the next clip in the hidden player
+  useEffect(() => {
+    if (videoStatus !== "ready") return
+    const sorted = [...videoClips].sort((a, b) => a.panelIndex - b.panelIndex)
+    const activeClip = sorted[activeClipIndex]
+    const nextClip = sorted[activeClipIndex + 1] ?? sorted[0] // loop
+
+    const activeEl = getActiveEl()
+    const nextEl = getNextEl()
+
+    if (activeEl && activeClip) {
+      activeEl.src = activeClip.videoUrl
+      activeEl.load()
+      activeEl.play().then(() => setIsPlaying(true)).catch(() => setIsPlaying(false))
+    }
+
+    // Preload the next clip in the hidden player
+    if (nextEl && nextClip) {
+      nextEl.src = nextClip.videoUrl
+      nextEl.load()
+    }
+  }, [activeClipIndex, videoStatus, videoClips, getActiveEl, getNextEl])
+
+  // When active clip ends, swap players instantly
   const handleVideoEnded = useCallback(() => {
     const sorted = [...videoClips].sort((a, b) => a.panelIndex - b.panelIndex)
-    setActiveClipIndex((cur) => {
-      const next = cur + 1
-      return next < sorted.length ? next : 0
-    })
-  }, [videoClips])
+    const nextIdx = activeClipIndex + 1 < sorted.length ? activeClipIndex + 1 : 0
 
-  // Play the active clip when it changes or when entering ready state
-  useEffect(() => {
-    if (videoStatus !== "ready" || !videoRef.current) return
-    const sorted = [...videoClips].sort((a, b) => a.panelIndex - b.panelIndex)
-    const clip = sorted[activeClipIndex]
-    if (!clip) return
+    // Swap: hidden player becomes visible and starts playing
+    setActivePlayer((cur) => (cur === "A" ? "B" : "A"))
+    setActiveClipIndex(nextIdx)
 
-    videoRef.current.src = clip.videoUrl
-    videoRef.current.load()
-    videoRef.current.play()
-      .then(() => setIsPlaying(true))
-      .catch(() => setIsPlaying(false))
-  }, [activeClipIndex, videoStatus, videoClips])
+    // The new active player already has the clip preloaded — play it
+    const nextEl = getNextEl()
+    if (nextEl) {
+      nextEl.play().then(() => setIsPlaying(true)).catch(() => {})
+    }
+  }, [videoClips, activeClipIndex, getNextEl])
 
   function handleClose() {
-    abortRef.current?.abort()
+    // Don't abort — let the server finish and upload to R2.
+    // Pausing the active video prevents audio bleed after close.
+    videoARef.current?.pause()
+    videoBRef.current?.pause()
     onClose()
   }
 
@@ -220,13 +295,23 @@ export function StoryTransitionOverlay({ animation, onClose, onClipProgress }: S
 
       <div className="relative mx-auto h-[86vh] w-full max-w-[620px] overflow-hidden rounded-2xl border border-white/20 bg-black">
         {videoStatus === "ready" ? (
-          /* Video playback mode — clips play sequentially and loop */
-          <video
-            ref={videoRef}
-            className="absolute inset-0 h-full w-full object-cover"
-            playsInline
-            onEnded={handleVideoEnded}
-          />
+          /* Dual video players for gapless playback */
+          <>
+            <video
+              ref={videoARef}
+              className="absolute inset-0 h-full w-full object-cover transition-opacity duration-100"
+              style={{ opacity: activePlayer === "A" ? 1 : 0 }}
+              playsInline
+              onEnded={activePlayer === "A" ? handleVideoEnded : undefined}
+            />
+            <video
+              ref={videoBRef}
+              className="absolute inset-0 h-full w-full object-cover transition-opacity duration-100"
+              style={{ opacity: activePlayer === "B" ? 1 : 0 }}
+              playsInline
+              onEnded={activePlayer === "B" ? handleVideoEnded : undefined}
+            />
+          </>
         ) : (
           /* CSS morph mode (while generating) */
           <>

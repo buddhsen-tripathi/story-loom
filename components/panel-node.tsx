@@ -13,8 +13,10 @@ export interface PanelData extends Record<string, unknown> {
   branchColor: string
   isLoading: boolean
   hasFailed: boolean
+  videoUrl?: string
+  videoKey?: string
   onBranch: (nodeId: string) => void
-  onAnimate: (branchId: string) => void
+  onAnimate: (branchId: string, nodeId: string) => void
 }
 
 export type PanelNodeType = Node<PanelData>
@@ -70,7 +72,7 @@ export function PanelNode({ data, id }: NodeProps<PanelNodeType>) {
         <button
           type="button"
           disabled={!hasImage}
-          onClick={() => data.onAnimate(data.branchId)}
+          onClick={() => data.onAnimate(data.branchId, id)}
           className="flex min-h-8 items-center justify-center rounded-full border border-primary/30 px-2 py-1 text-center text-[10px] uppercase tracking-[0.06em] text-primary/80 whitespace-nowrap transition-colors hover:bg-primary/10 hover:text-primary disabled:cursor-not-allowed disabled:opacity-40"
         >
           Animate
